@@ -7,12 +7,16 @@ dist/
 build/
 .env
 .venv
+.venv*/
 env/
 venv/
 wandb/
 output/
+outputs/
 experiment/
 data/
+logs/
+eval_results/
 *.sqlite3
 .DS_Store
 .ipynb_checkpoints/
