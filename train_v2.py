@@ -152,6 +152,8 @@ class EnhancedTrainer(Trainer):
             self.original_model.eval()
         self._target_prob_stats = None
         self._target_prob_last_step = None
+        self._adaptive_hard_weight_stats = None
+        self._adaptive_hard_weight_last_step = None
         print(
             f"Training mode: {mode}, alpha: {alpha}, s3ft_beta: {s3ft_beta}, "
             f"s3ft_tau: {s3ft_tau}, s3ft_kl_direction: {s3ft_kl_direction}, "
@@ -196,6 +198,49 @@ class EnhancedTrainer(Trainer):
             f"{self.mode}_target_prob_mean": stats["sum"] / stats["count"],
         })
         self._target_prob_stats = None
+
+    def _update_adaptive_hard_weight_stats(self, hard_weights: torch.Tensor):
+        if hard_weights.numel() == 0:
+            return
+
+        current_step = int(self.state.global_step)
+        if self._adaptive_hard_weight_last_step is None:
+            self._adaptive_hard_weight_last_step = current_step
+        elif current_step != self._adaptive_hard_weight_last_step:
+            self._flush_adaptive_hard_weight_stats()
+            self._adaptive_hard_weight_last_step = current_step
+
+        weights = hard_weights.detach().float()
+        batch_stats = {
+            "min": weights.min().item(),
+            "max": weights.max().item(),
+            "sum": weights.sum().item(),
+            "count": weights.numel(),
+        }
+
+        if self._adaptive_hard_weight_stats is None:
+            self._adaptive_hard_weight_stats = batch_stats
+        else:
+            self._adaptive_hard_weight_stats["min"] = min(
+                self._adaptive_hard_weight_stats["min"], batch_stats["min"]
+            )
+            self._adaptive_hard_weight_stats["max"] = max(
+                self._adaptive_hard_weight_stats["max"], batch_stats["max"]
+            )
+            self._adaptive_hard_weight_stats["sum"] += batch_stats["sum"]
+            self._adaptive_hard_weight_stats["count"] += batch_stats["count"]
+
+    def _flush_adaptive_hard_weight_stats(self):
+        stats = self._adaptive_hard_weight_stats
+        if not stats or stats["count"] == 0:
+            return
+
+        self.log({
+            f"{self.mode}_hard_weight_min": stats["min"],
+            f"{self.mode}_hard_weight_max": stats["max"],
+            f"{self.mode}_hard_weight_mean": stats["sum"] / stats["count"],
+        })
+        self._adaptive_hard_weight_stats = None
     
     def get_reference_logits(self, model, inputs):
         """
@@ -335,6 +380,49 @@ class EnhancedTrainer(Trainer):
                     else:
                         raise ValueError(f"Unsupported s3ft_kl_direction: {self.s3ft_kl_direction}")
 
+                elif self.mode == "s3ft_adaptive":
+                    if self.s3ft_teacher == "student":
+                        ref_probs = F.softmax(shift_logits.detach() / self.s3ft_tau, dim=-1)
+                    else:
+                        with torch.no_grad():
+                            ref_logits = self.get_reference_logits(model, inputs)
+                            ref_logits = ref_logits[..., :-1, :].contiguous()
+                            ref_logits = ref_logits.view(-1, ref_logits.size(-1))[:shift_logits.size(0)]
+                            ref_probs = F.softmax(ref_logits / self.s3ft_tau, dim=-1)
+
+                    student_log_probs = F.log_softmax(shift_logits, dim=-1)
+                    student_probs = student_log_probs.exp()
+                    valid_labels = torch.clamp(shift_labels, min=0, max=shift_logits.size(-1) - 1)
+
+                    target_confidence = student_probs.gather(
+                        1,
+                        valid_labels.unsqueeze(-1),
+                    ).squeeze(-1).detach()
+                    # Confidence-adaptive target: uncertain correct-token predictions
+                    # keep the original S3FT soft-teacher weight; confident ones decay to one-hot SFT.
+                    soft_weights = self.s3ft_beta * (1.0 - target_confidence)
+                    hard_weights = 1.0 - soft_weights
+                    self._update_target_prob_stats(target_confidence[valid_mask])
+                    self._update_adaptive_hard_weight_stats(hard_weights[valid_mask])
+
+                    q_probs = soft_weights.unsqueeze(-1) * ref_probs
+                    q_probs.scatter_add_(
+                        1,
+                        valid_labels.unsqueeze(-1),
+                        hard_weights.unsqueeze(-1),
+                    )
+                    q_log_probs = q_probs.clamp_min(1e-8).log()
+
+                    if self.s3ft_kl_direction == "fkl":
+                        weighted_losses = (
+                            q_probs * (q_log_probs - student_log_probs)
+                        ).sum(dim=-1)
+                    elif self.s3ft_kl_direction == "rkl":
+                        weighted_losses = (
+                            student_probs * (student_log_probs - q_log_probs)
+                        ).sum(dim=-1)
+                    else:
+                        raise ValueError(f"Unsupported s3ft_kl_direction: {self.s3ft_kl_direction}")
 
                 loss = (weighted_losses[valid_mask].sum() / valid_mask.sum())
 
@@ -468,7 +556,7 @@ def train(
     num_train_epochs: float = 3.0,
     learning_rate: float = 2e-5,
     global_batch_size: int = 64,
-    mode: str = "sft",  # sft, dft, sft+kl, asft, s3ft
+    mode: str = "sft",  # sft, dft, sft+kl, asft, s3ft, s3ft_adaptive
     kl_weight: float = 0.1,
     alpha: float = 0.1,
     s3ft_beta: float = 0.3,
@@ -531,13 +619,17 @@ def train(
     precision = precision.lower()
     if precision not in {"bf16", "fp16", "fp32"}:
         raise ValueError(f"Unsupported precision: {precision}. Use bf16, fp16, or fp32.")
+    mode = mode.lower()
+    supported_modes = {"sft", "dft", "sft+kl", "asft", "s3ft", "s3ft_adaptive"}
+    if mode not in supported_modes:
+        raise ValueError(f"Unsupported mode: {mode}. Use one of {sorted(supported_modes)}.")
     s3ft_kl_direction = s3ft_kl_direction.lower()
     if s3ft_kl_direction not in {"fkl", "rkl"}:
         raise ValueError(f"Unsupported s3ft_kl_direction: {s3ft_kl_direction}. Use fkl or rkl.")
     s3ft_teacher = s3ft_teacher.lower()
     if s3ft_teacher not in {"base", "student", "ema"}:
         raise ValueError(f"Unsupported s3ft_teacher: {s3ft_teacher}. Use base, student, or ema.")
-    if use_lora and mode == "s3ft" and s3ft_teacher == "ema":
+    if use_lora and mode in {"s3ft", "s3ft_adaptive"} and s3ft_teacher == "ema":
         raise ValueError("s3ft_teacher=ema is only supported for full fine-tuning in this script.")
     use_bf16 = precision == "bf16"
     use_fp16 = precision == "fp16"
@@ -640,7 +732,7 @@ def train(
     needs_original_model = (
         "kl" in mode
         or mode == "asft"
-        or (mode == "s3ft" and s3ft_teacher in {"base", "ema"})
+        or (mode in {"s3ft", "s3ft_adaptive"} and s3ft_teacher in {"base", "ema"})
     )
     if needs_original_model and not use_lora:
         print("Loading original model for reference/EMA divergence...")
@@ -733,7 +825,7 @@ def train(
         **data_module
     )
 
-    if mode == "s3ft" and s3ft_teacher == "ema":
+    if mode in {"s3ft", "s3ft_adaptive"} and s3ft_teacher == "ema":
         if original_model is None:
             raise ValueError("s3ft_teacher=ema requires an EMA teacher model.")
         trainer.add_callback(
